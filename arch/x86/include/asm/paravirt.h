@@ -711,7 +711,23 @@ static inline void __set_fixmap(unsigned /* enum fixed_addresses */ idx,
 }
 
 #if defined(CONFIG_SMP) && defined(CONFIG_PARAVIRT_SPINLOCKS)
+#ifdef CONFIG_QUEUE_SPINLOCK
+static __always_inline void __queue_kick_cpu(int cpu)
+{
+	PVOP_VCALL1(pv_lock_ops.kick_cpu, cpu);
+}
 
+static __always_inline void
+__queue_halt_cpu(enum pv_lock_stats type, s8 *state, s8 sval)
+{
+	PVOP_VCALL3(pv_lock_ops.halt_cpu, type, state, sval);
+}
+
+static __always_inline void __queue_lockstat(enum pv_lock_stats type)
+{
+	PVOP_VCALL1(pv_lock_ops.lockstat, type);
+}
+#else
 static __always_inline void __ticket_lock_spinning(struct arch_spinlock *lock,
 							__ticket_t ticket)
 {
@@ -723,7 +739,7 @@ static __always_inline void __ticket_unlock_kick(struct arch_spinlock *lock,
 {
 	PVOP_VCALL2(pv_lock_ops.unlock_kick, lock, ticket);
 }
-
+#endif
 #endif
 
 #ifdef CONFIG_X86_32

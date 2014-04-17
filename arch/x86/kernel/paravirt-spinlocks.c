@@ -11,8 +11,14 @@
 #ifdef CONFIG_PARAVIRT_SPINLOCKS
 struct pv_lock_ops pv_lock_ops = {
 #ifdef CONFIG_SMP
+#ifdef CONFIG_QUEUE_SPINLOCK
+	.kick_cpu = paravirt_nop,
+	.halt_cpu = paravirt_nop,
+	.lockstat = paravirt_nop,
+#else
 	.lock_spinning = __PV_IS_CALLEE_SAVE(paravirt_nop),
 	.unlock_kick = paravirt_nop,
+#endif
 #endif
 };
 EXPORT_SYMBOL(pv_lock_ops);
