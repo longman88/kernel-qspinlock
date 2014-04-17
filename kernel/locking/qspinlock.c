@@ -68,6 +68,7 @@
 struct qnode {
 	struct mcs_spinlock mcs;
 };
+#define qhead	mcs.locked	/* The queue head flag */
 
 /*
  * Per-CPU queue node structures; we can never have more than 4 nested
@@ -220,18 +221,20 @@ xchg_tail(struct qspinlock *lock, u32 tail, u32 *pval)
 
 /**
  * get_qlock - Set the lock bit and own the lock
- * @lock: Pointer to queue spinlock structure
+ * @lock : Pointer to queue spinlock structure
+ * Return: 1 if lock acquired, 0 otherwise
  *
  * This routine should only be called when the caller is the only one
  * entitled to acquire the lock.
  */
-static __always_inline void get_qlock(struct qspinlock *lock)
+static __always_inline int get_qlock(struct qspinlock *lock)
 {
 	struct __qspinlock *l = (void *)lock;
 
 	barrier();
 	ACCESS_ONCE(l->locked) = _Q_LOCKED_VAL;
 	barrier();
+	return 1;
 }
 
 /**
@@ -366,7 +369,7 @@ void queue_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 	tail = encode_tail(smp_processor_id(), idx);
 
 	node += idx;
-	node->mcs.locked = 0;
+	node->qhead = 0;
 	node->mcs.next = NULL;
 
 	/*
@@ -392,7 +395,7 @@ void queue_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 		prev = decode_tail(old);
 		ACCESS_ONCE(prev->mcs.next) = (struct mcs_spinlock *)node;
 
-		while (!smp_load_acquire(&node->mcs.locked))
+		while (!smp_load_acquire(&node->qhead))
 			arch_mutex_cpu_relax();
 	}
 
@@ -404,6 +407,7 @@ void queue_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 	 *
 	 * *,x,y -> *,0,0
 	 */
+retry_queue_wait:
 	while ((val = smp_load_acquire(&lock->val.counter))
 				       & _Q_LOCKED_PENDING_MASK)
 		arch_mutex_cpu_relax();
@@ -420,12 +424,20 @@ void queue_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 	 */
 	for (;;) {
 		if (val != tail) {
-			get_qlock(lock);
-			break;
+			/*
+			 * The get_qlock function will only failed if the
+			 * lock was stolen.
+			 */
+			if (get_qlock(lock))
+				break;
+			else
+				goto retry_queue_wait;
 		}
 		old = atomic_cmpxchg(&lock->val, val, _Q_LOCKED_VAL);
 		if (old == val)
 			goto release;	/* No contention */
+		else if (old & _Q_LOCKED_MASK)
+			goto retry_queue_wait;
 
 		val = old;
 	}
@@ -436,7 +448,7 @@ void queue_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 	while (!(next = (struct qnode *)ACCESS_ONCE(node->mcs.next)))
 		arch_mutex_cpu_relax();
 
-	arch_mcs_spin_unlock_contended(&next->mcs.locked);
+	arch_mcs_spin_unlock_contended(&next->qhead);
 
 release:
 	/*
