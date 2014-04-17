@@ -231,6 +231,14 @@ static __always_inline int get_qlock(struct qspinlock *lock)
 {
 	struct __qspinlock *l = (void *)lock;
 
+#ifdef CONFIG_PARAVIRT_UNFAIR_LOCKS
+	if (static_key_false(&paravirt_unfairlocks_enabled))
+		/*
+		 * Need to use atomic operation to get the lock when
+		 * lock stealing can happen.
+		 */
+		return cmpxchg(&l->locked, 0, _Q_LOCKED_VAL) == 0;
+#endif
 	barrier();
 	ACCESS_ONCE(l->locked) = _Q_LOCKED_VAL;
 	barrier();
