@@ -76,6 +76,30 @@ struct qnode {
 #define qhead	mcs.locked	/* The queue head flag */
 
 /*
+ * Allow spinning loop count only if either PV spinlock or unfair lock is
+ * configured.
+ */
+#if defined(CONFIG_PARAVIRT_UNFAIR_LOCKS) || defined(CONFIG_PARAVIRT_SPINLOCKS)
+#define	DEF_LOOP_CNT(c)		int c = 0
+#define	INC_LOOP_CNT(c)		(c)++
+#define	LOOP_CNT(c)		c
+#else
+#define	DEF_LOOP_CNT(c)
+#define	INC_LOOP_CNT(c)
+#define	LOOP_CNT(c)		0
+#endif
+
+/*
+ * Check the pending bit spinning threshold only if PV qspinlock is enabled
+ */
+#define PSPIN_THRESHOLD		(1 << 10)
+#ifdef CONFIG_PARAVIRT_SPINLOCKS
+#define pv_qspinlock_enabled()	static_key_false(&paravirt_spinlocks_enabled)
+#else
+#define pv_qspinlock_enabled()	false
+#endif
+
+/*
  * Per-CPU queue node structures; we can never have more than 4 nested
  * contexts: task, softirq, hardirq, nmi.
  *
@@ -306,9 +330,6 @@ cmpxchg_tail(struct qspinlock *lock, u32 old, u32 new)
  * starvation.
  */
 #ifdef CONFIG_PARAVIRT_UNFAIR_LOCKS
-#define DEF_LOOP_CNT(c)		int c = 0
-#define INC_LOOP_CNT(c)		(c)++
-#define LOOP_CNT(c)		c
 #define LSTEAL_MIN		(1 << 3)
 #define LSTEAL_MAX		(1 << 10)
 #define LSTEAL_MIN_MASK		(LSTEAL_MIN - 1)
@@ -334,7 +355,11 @@ static inline void unfair_init_vars(struct qnode *node)
 static inline void
 unfair_set_vars(struct qnode *node, struct qnode *prev, u32 prev_tail)
 {
-	if (!static_key_false(&paravirt_unfairlocks_enabled))
+	/*
+	 * Disable waiter lock stealing if PV spinlock is enabled
+	 */
+	if (pv_qspinlock_enabled() ||
+	   !static_key_false(&paravirt_unfairlocks_enabled))
 		return;
 
 	node->qprev	= prev;
@@ -360,7 +385,11 @@ unfair_set_vars(struct qnode *node, struct qnode *prev, u32 prev_tail)
  */
 static inline int unfair_check_and_clear_tail(struct qspinlock *lock, u32 tail)
 {
-	if (!static_key_false(&paravirt_unfairlocks_enabled))
+	/*
+	 * Disable waiter lock stealing if PV spinlock is enabled
+	 */
+	if (pv_qspinlock_enabled() ||
+	   !static_key_false(&paravirt_unfairlocks_enabled))
 		return false;
 
 	/*
@@ -389,7 +418,11 @@ unfair_get_lock(struct qspinlock *lock, struct qnode *node, u32 tail, int count)
 	int	     isqhead;
 	struct qnode *next;
 
-	if (!static_key_false(&paravirt_unfairlocks_enabled) ||
+	/*
+	 * Disable waiter lock stealing if PV spinlock is enabled
+	 */
+	if (pv_qspinlock_enabled() ||
+	   !static_key_false(&paravirt_unfairlocks_enabled) ||
 	   ((count & node->lsteal_mask) != node->lsteal_mask))
 		return false;
 
@@ -467,9 +500,6 @@ unfair_get_lock(struct qspinlock *lock, struct qnode *node, u32 tail, int count)
 }
 
 #else /* CONFIG_PARAVIRT_UNFAIR_LOCKS */
-#define	DEF_LOOP_CNT(c)
-#define	INC_LOOP_CNT(c)
-#define	LOOP_CNT(c)	0
 
 static void unfair_init_vars(struct qnode *node)	{}
 static void unfair_set_vars(struct qnode *node, struct qnode *prev,
@@ -587,9 +617,28 @@ static inline int trylock_pending(struct qspinlock *lock, u32 *pval)
 	 * store-release that clears the locked bit and create lock
 	 * sequentiality; this because not all try_clear_pending_set_locked()
 	 * implementations imply full barriers.
+	 *
+	 * When PV qspinlock is enabled, exit the pending bit code path and
+	 * go back to the regular queuing path if the lock isn't available
+	 * within a certain threshold.
 	 */
-	while ((val = smp_load_acquire(&lock->val.counter)) & _Q_LOCKED_MASK)
+	if (pv_qspinlock_enabled())
+		retry = PSPIN_THRESHOLD;
+	while ((val = smp_load_acquire(&lock->val.counter)) & _Q_LOCKED_MASK) {
+		if (pv_qspinlock_enabled() && (--retry == 0)) {
+			/*
+			 * Clear the pending bit and exit
+			 */
+			for (;;) {
+				new = val & ~_Q_PENDING_MASK;
+				old = atomic_cmpxchg(&lock->val, val, new);
+				if (old == val)
+					return 0;
+				val = old;
+			}
+		}
 		arch_mutex_cpu_relax();
+	}
 
 	/*
 	 * take ownership and clear the pending bit.
@@ -650,6 +699,8 @@ queue_spin_lock_slowerpath(struct qspinlock *lock, struct qnode *node, u32 tail)
 			}
 			arch_mutex_cpu_relax();
 		}
+	} else {
+		ACCESS_ONCE(node->qhead) = true;
 	}
 
 	/*
@@ -717,6 +768,9 @@ notify_next:
 	while (!(next = (struct qnode *)ACCESS_ONCE(node->mcs.next)))
 		arch_mutex_cpu_relax();
 
+	/*
+	 * The next one in queue is now at the head
+	 */
 	arch_mcs_spin_unlock_contended(&next->qhead);
 }
 
