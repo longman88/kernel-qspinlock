@@ -61,12 +61,21 @@
 #include "mcs_spinlock.h"
 
 /*
+ * To have additional features for better virtualization support, it is
+ * necessary to store additional data in the queue node structure. So
+ * a new queue node structure will have to be defined and used here.
+ */
+struct qnode {
+	struct mcs_spinlock mcs;
+};
+
+/*
  * Per-CPU queue node structures; we can never have more than 4 nested
  * contexts: task, softirq, hardirq, nmi.
  *
  * Exactly fits one cacheline.
  */
-static DEFINE_PER_CPU_ALIGNED(struct mcs_spinlock, mcs_nodes[4]);
+static DEFINE_PER_CPU_ALIGNED(struct qnode, qnodes[4]);
 
 /*
  * We must be able to distinguish between no-tail and the tail at 0:0,
@@ -83,12 +92,12 @@ static inline u32 encode_tail(int cpu, int idx)
 	return tail;
 }
 
-static inline struct mcs_spinlock *decode_tail(u32 tail)
+static inline struct qnode *decode_tail(u32 tail)
 {
 	int cpu = (tail >> _Q_TAIL_CPU_OFFSET) - 1;
 	int idx = (tail &  _Q_TAIL_IDX_MASK) >> _Q_TAIL_IDX_OFFSET;
 
-	return per_cpu_ptr(&mcs_nodes[idx], cpu);
+	return per_cpu_ptr(&qnodes[idx], cpu);
 }
 
 #define _Q_LOCKED_PENDING_MASK	(_Q_LOCKED_MASK | _Q_PENDING_MASK)
@@ -343,7 +352,7 @@ static inline int trylock_pending(struct qspinlock *lock, u32 *pval)
  */
 void queue_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 {
-	struct mcs_spinlock *prev, *next, *node;
+	struct qnode *prev, *next, *node;
 	u32 old, tail;
 	int idx;
 
@@ -352,13 +361,13 @@ void queue_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 	if (trylock_pending(lock, &val))
 		return;	/* Lock acquired */
 
-	node = this_cpu_ptr(&mcs_nodes[0]);
-	idx = node->count++;
+	node = this_cpu_ptr(&qnodes[0]);
+	idx = node->mcs.count++;
 	tail = encode_tail(smp_processor_id(), idx);
 
 	node += idx;
-	node->locked = 0;
-	node->next = NULL;
+	node->mcs.locked = 0;
+	node->mcs.next = NULL;
 
 	/*
 	 * We touched a (possibly) cold cacheline; attempt the trylock once
@@ -381,9 +390,10 @@ void queue_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 	 */
 	if (old & _Q_TAIL_MASK) {
 		prev = decode_tail(old);
-		ACCESS_ONCE(prev->next) = node;
+		ACCESS_ONCE(prev->mcs.next) = (struct mcs_spinlock *)node;
 
-		arch_mcs_spin_lock_contended(&node->locked);
+		while (!smp_load_acquire(&node->mcs.locked))
+			arch_mutex_cpu_relax();
 	}
 
 	/*
@@ -423,15 +433,15 @@ void queue_spin_lock_slowpath(struct qspinlock *lock, u32 val)
 	/*
 	 * contended path; wait for next, release.
 	 */
-	while (!(next = ACCESS_ONCE(node->next)))
+	while (!(next = (struct qnode *)ACCESS_ONCE(node->mcs.next)))
 		arch_mutex_cpu_relax();
 
-	arch_mcs_spin_unlock_contended(&next->locked);
+	arch_mcs_spin_unlock_contended(&next->mcs.locked);
 
 release:
 	/*
 	 * release the node
 	 */
-	this_cpu_dec(mcs_nodes[0].count);
+	this_cpu_dec(qnodes[0].mcs.count);
 }
 EXPORT_SYMBOL(queue_spin_lock_slowpath);
